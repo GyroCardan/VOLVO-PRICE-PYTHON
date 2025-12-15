@@ -6,7 +6,40 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from tqdm import tqdm
 from datetime import datetime, timedelta
+import math  # 👈 добавь к импортам, если ещё нет
 
+# Импорт библиотеки для работы с CatID
+from CatID_lib import (
+    ensure_catid_soft,
+    ensure_catid_hardware,
+    ensure_catid_by_pg,
+    apply_catid_overrides,
+    backfill_catid_from_previous_excel,
+    print_catid_statistics,
+    get_empty_catid_condition,
+    get_catid_statistics,
+    norm_part,
+)
+
+# ...
+
+EUR_TO_SEK_RATE = 10.8  # ⚖️ Курс EUR→SEK как в processing.py (можешь поправить при необходимости)
+
+# CategoryID (CatID) → код категории в 1С
+CATEGORY_MAPPING_1C = {
+    4:    'РСОН00005',
+    10:   'И00000002',
+    20:   '000000001',
+    15:   'РСОН00003',
+    70:   '000000003',
+    60:   'И00000003',
+    30:   '000000004',
+    40:   '000000002',
+    50:   'N00000004',
+    80:   'РСОН00002',
+    65:   'SRVIS0005',
+    1000: 'SW0000002',
+}
 # ------------------------------------------------------------
 # ⚙️ Константы/пути
 # ------------------------------------------------------------
@@ -50,34 +83,7 @@ def find_file_by_prefix(folder: str, prefix: str):
     return files[0] if files else None
 
 
-def norm_part(x):
-    # None / NaN -> None
-    if x is None:
-        return None
-    try:
-        if x != x:  # NaN != NaN
-            return None
-    except:
-        pass
-
-    s = str(x).strip()
-    if not s:
-        return None
-
-    # Если это число с плавающей точкой вида 123.0 / научная запись — делаем целым
-    try:
-        f = float(s.replace(',', '.'))
-        if f.is_integer():
-            return str(int(f))
-    except:
-        pass
-
-    # Если это чисто целая строка — тоже нормализуем
-    try:
-        return str(int(s))
-    except:
-        # иначе оставляем как есть (например, если есть буквы)
-        return s
+# norm_part теперь импортируется из CatID_lib
 
 def safe_int(value):
     try:
@@ -240,10 +246,28 @@ def parse_pricelist_line(line: str):
 
 
 def parse_replace_line(line: str):
+    """
+    Разбор строки из Gold_Replacement_M3_*.txt.
+    Делаем максимально устойчиво:
+    - не падаем на мусоре
+    - PartNumber / ReplacingPart нормализуем через norm_part
+    """
+    if not line:
+        return None
+
+    # Мини-фильтр по длине, чтобы не трогать явно обрезанные строки
+    if len(line) < 32:
+        return None
+
     record_type = safe_int(line[0:1].strip())
+    if record_type not in (1, 2, 3):
+        # неизвестный тип записи — просто игнорируем
+        return None
+
     data = {
         "RecordType": record_type,
-        "PartNumber": norm_part(line[2:13]),        # ⚠️ проверь ширину под свой файл
+        # НИКАКИХ int(...) напрямую – только norm_part
+        "PartNumber": norm_part(line[2:13]),   # ⚠️ если нужно 2:11, потом подправим по факту
         "CheckDigit": line[13:14].strip(),
         "LineNumber": safe_int(line[14:17].strip()),
         "ReplacedQuantity": None,
@@ -257,26 +281,30 @@ def parse_replace_line(line: str):
     }
 
     if record_type == 1:
+        # базовая строка, тут в т.ч. ReplacedCode (включая '029')
         data.update({
             "ReplacedQuantity": safe_float(line[17:24].strip()),
             "WeekReplaced": safe_int(line[25:29].strip()),
             "ReplacedCode": line[29:32].strip(),
             "Description": line[57:82].strip(),
         })
+
     elif record_type == 2:
+        # строка с инфотекстом
         data.update({
             "InfoText": line[17:37].strip(),
         })
+
     elif record_type == 3:
+        # строка с заменяющим артикулом
         data.update({
-            "ReplacingPart": norm_part(line[17:29]),  # ⚠️ проверь ширину под свой файл
+            "ReplacingPart": norm_part(line[17:29]),
             "ReplacingCheckDigit": line[29:30].strip(),
             "ReplacingQuantity": safe_float(line[30:37].strip()),
             "Description": line[62:87].strip(),
         })
 
     return data
-
 
 def parse_emblem_line(line: str):
     return {
@@ -432,41 +460,8 @@ def is_catid_empty(catid_value):
     return False
 
 
-def get_empty_catid_condition():
-    """Возвращает SQL условие для проверки пустого CatID.
-    Используется единообразно во всех функциях заполнения категорий.
-    """
-    return "(CatID IS NULL OR TRIM(COALESCE(CatID, '')) = '')"
-
-
-def get_catid_statistics():
-    """Возвращает статистику заполнения CatID для отладки и контроля."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    cur = conn.cursor()
-    
-    cur.execute(f"SELECT COUNT(*) FROM {PRICELIST_TABLE_NAME}")
-    total = cur.fetchone()[0]
-    
-    empty_condition = get_empty_catid_condition()
-    cur.execute(f"SELECT COUNT(*) FROM {PRICELIST_TABLE_NAME} WHERE {empty_condition}")
-    empty = cur.fetchone()[0]
-    
-    filled = total - empty
-    
-    conn.close()
-    return {
-        'total': total,
-        'filled': filled,
-        'empty': empty,
-        'filled_percent': round(filled / total * 100, 2) if total > 0 else 0
-    }
-
-
-def print_catid_statistics(stage_name: str = ""):
-    """Выводит статистику заполнения CatID на текущий момент."""
-    stats = get_catid_statistics()
-    prefix = f"[{stage_name}] " if stage_name else ""
-    print(f"{prefix}📊 CatID статистика: заполнено {stats['filled']}/{stats['total']} ({stats['filled_percent']}%), пустых: {stats['empty']}")
+# Функции get_empty_catid_condition, get_catid_statistics, print_catid_statistics
+# теперь импортируются из CatID_lib
 
 
 def check_missing_discount_codes():
@@ -638,41 +633,19 @@ def compute_dealer_stock_price():
     print(f"   Использовано Python round для правильного округления (99.86% совпадение с эталоном)")
 
 
-def ensure_catid_soft():
-    """Назначает CatID='1000' для программного обеспечения (UnitSort='SW').
-    Заполняет ТОЛЬКО пустые CatID, не перезаписывает существующие.
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-    cur.execute(f"""
-        UPDATE {PRICELIST_TABLE_NAME}
-        SET CatID = '1000'
-        WHERE UnitSort = 'SW'
-          AND {empty_condition}
-    """)
-    updated = cur.rowcount
-    conn.commit(); conn.close()
-    print(f"🏷️ Soft назначен {updated} позициям (CatID='1000'; только пустые).")
+# Функции ensure_catid_soft и ensure_catid_hardware теперь импортируются из CatID_lib
 
-
-def ensure_catid_hardware():
-    """Назначает CatID='4' для электроники (UnitSort='HW').
-    Заполняет ТОЛЬКО пустые CatID, не перезаписывает существующие.
-    Приоритет такой же, как у ensure_catid_soft() - шаг 1.
+def ensure_column_exists(table: str, column: str, column_type: str, conn: sqlite3.Connection):
     """
-    conn = sqlite3.connect(DATABASE_PATH)
+    Проверяет наличие колонки в таблице и добавляет её, если отсутствует.
+    column_type – строка типа SQLite: 'REAL', 'TEXT', 'INTEGER' и т.п.
+    """
     cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-    cur.execute(f"""
-        UPDATE {PRICELIST_TABLE_NAME}
-        SET CatID = '4'
-        WHERE UnitSort = 'HW'
-          AND {empty_condition}
-    """)
-    updated = cur.rowcount
-    conn.commit(); conn.close()
-    print(f"🏷️ Hardware (Electronics) назначен {updated} позициям (CatID='4'; только пустые).")
+    cur.execute(f"PRAGMA table_info({table});")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type};")
+        conn.commit()
 
 
 # ------------------------------------------------------------
@@ -686,55 +659,49 @@ def ensure_catid_hardware():
 #   25 — MERCHANDISE
 # ------------------------------------------------------------
 
-def ensure_catid_by_pg(mapping):
-    """Назначает CatID по значениям ProductGroup согласно словарю mapping {PG:int -> CatID:str}.
-    Пример: ensure_catid_by_pg({15: '20', 25: '80'})
-    Обновляет ТОЛЬКО пустые CatID, не перезаписывает существующие.
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-    total = 0
-    for pg, cat in mapping.items():
-        cur.execute(f"""
-            UPDATE {PRICELIST_TABLE_NAME}
-            SET CatID = ?
-            WHERE ProductGroup = ?
-              AND {empty_condition}
-        """, (str(cat), int(pg)))
-        cnt = cur.rowcount
-        total += cnt
-        print(f"🏷️ PG={pg} → CatID='{cat}': {cnt} поз. (только пустые)")
-    conn.commit(); conn.close()
-    print(f"✅ Итого обновлено по PG-мэппингу: {total} позиций.")
+# Функция ensure_catid_by_pg теперь импортируется из CatID_lib
 
 # --- Обогащение описаний: >>>(...) и метка снято с производства ---
 
 def enrich_descriptions_from_replacements():
+    """
+    Обновляет Description в volvo_price_list:
+    - Добавляет '!!! NOT STORED ANYMORE !!!' для деталей с ReplacedCode = '029'
+    - Добавляет '>>> (P1 + P2 + ...)' — до 4 кодов замены, далее ' ++'
+    """
     conn = sqlite3.connect(DATABASE_PATH)
+    print("🧩 enrich_descriptions_from_replacements(): старт")
 
     # 1) Замены: берём только RecordType=3 (содержит ReplacingPart)
     df_r = pd.read_sql(f"""
         SELECT PartNumber, ReplacingPart
         FROM {REPLACEMENT_TABLE_NAME}
         WHERE RecordType = 3
-          AND ReplacingPart IS NOT NULL AND TRIM(ReplacingPart) != ''
+          AND ReplacingPart IS NOT NULL
+          AND TRIM(ReplacingPart) != ''
     """, conn)
-    # На всякий — нормализация
-    df_r["PartNumber"] = df_r["PartNumber"].map(norm_part)
-    df_r["ReplacingPart"] = df_r["ReplacingPart"].map(norm_part)
 
-    def join_limited(series):
-        vals = [v for v in series if v]
-        top = vals[:4]
-        suffix = " ++" if len(vals) > 4 else ""
-        return " + ".join(top) + suffix if top else None
+    if df_r.empty:
+        print("⚠️ В таблице замен нет записей RecordType=3 с непустым ReplacingPart — >>>(...) добавлять не из чего.")
+        df_repl = pd.DataFrame(columns=["PartNumber", "Replacements"])
+    else:
+        # Нормализация
+        df_r["PartNumber"] = df_r["PartNumber"].map(norm_part)
+        df_r["ReplacingPart"] = df_r["ReplacingPart"].map(norm_part)
+        df_r = df_r.dropna(subset=["PartNumber", "ReplacingPart"])
 
-    df_repl = (
-        df_r.groupby("PartNumber")["ReplacingPart"]
-            .apply(join_limited)
-            .reset_index(name="Replacements")
-    )
+        def join_limited(series):
+            vals = [v for v in series if v]
+            top = vals[:4]
+            suffix = " ++" if len(vals) > 4 else ""
+            return " + ".join(top) + suffix if top else None
+
+        df_repl = (
+            df_r.groupby("PartNumber")["ReplacingPart"]
+                .apply(join_limited)
+                .reset_index(name="Replacements")
+        )
+        print(f"   🔁 Уникальных PartNumber с заменами: {len(df_repl)}")
 
     # 2) Снятые с производства: RecordType=1 с ReplacedCode='029'
     df_disc = pd.read_sql(f"""
@@ -742,28 +709,78 @@ def enrich_descriptions_from_replacements():
         FROM {REPLACEMENT_TABLE_NAME}
         WHERE RecordType = 1 AND ReplacedCode = '029'
     """, conn)
-    disc_set = set(df_disc["PartNumber"].dropna())
 
-    # 3) Загружаем текущий прайс и вливаем
+    if df_disc.empty:
+        print("⚠️ Не найдено ни одного PartNumber с ReplacedCode='029' — 'NOT STORED ANYMORE' добавляться не будет.")
+        disc_set = set()
+    else:
+        df_disc["PartNumber"] = df_disc["PartNumber"].map(norm_part)
+        df_disc = df_disc.dropna(subset=["PartNumber"])
+        disc_set = set(df_disc["PartNumber"])
+        print(f"   🚫 Снято с производства (029): {len(disc_set)} артикулов")
+
+    # 3) Загружаем текущий прайс
     df_p = pd.read_sql(f"SELECT PartNumber, Description FROM {PRICELIST_TABLE_NAME}", conn)
+    if df_p.empty:
+        print("⚠️ Прайс-лист пуст — обогащать нечего.")
+        conn.close()
+        return
+
+    # Нормализуем артикулы и там, и там
+    df_p["PartNumber"] = df_p["PartNumber"].map(norm_part)
+    df_p = df_p.dropna(subset=["PartNumber"])
     df_p["Description"] = df_p["Description"].fillna("")
+
+    print(f"   📦 Строк в прайсе для обработки: {len(df_p)}")
+
+    # 🔍 Диагностика: пересечение множеств артикулов
+    if not df_repl.empty:
+        set_repl = set(df_repl["PartNumber"])
+        set_price = set(df_p["PartNumber"])
+        common = set_repl & set_price
+        print(f"   🔍 PartNumber в replacement: {len(set_repl)}, в прайсе: {len(set_price)}, пересечение: {len(common)}")
+        if common:
+            sample = list(sorted(common))[:10]
+            print(f"   🔍 Примеры общих артикулов: {sample}")
+        else:
+            print("   ⚠️ НЕТ пересечения PartNumber между прайсом и таблицей замен — >>>(...) физически не к чему приклеить.")
+    else:
+        print("   ℹ️ df_repl пуст — пересечение считать не с чем.")
+
+    # 3.1) Мержим замены
     df_p = df_p.merge(df_repl, on="PartNumber", how="left")
 
-    # 3.1) Добавляем >>>(...) только если его ещё нет и есть что добавить
-    mask_no_arrow = ~df_p["Description"].str.contains(">>>", na=False)
-    mask_has_repl = df_p["Replacements"].notna() & (df_p["Replacements"].str.len() > 0)
-    to_arrow = mask_no_arrow & mask_has_repl
-    df_p.loc[to_arrow, "Description"] = df_p["Description"] + " >>> (" + df_p["Replacements"] + ")"
+    # Флаги уже существующих меток
+    has_arrow = df_p["Description"].str.contains(">>>", na=False)
+    has_not = df_p["Description"].str.contains("NOT STORED ANYMORE", na=False)
 
-    # 3.2) Добавляем !!! NOT STORED ANYMORE !!! если PartNumber в disc_set и метки нет
-    mask_no_not = ~df_p["Description"].str.contains("NOT STORED ANYMORE", na=False)
+    # 3.2) Добавляем >>>(...) где нужно
+    mask_has_repl = df_p["Replacements"].notna() & (df_p["Replacements"].str.len() > 0)
+    to_arrow = (~has_arrow) & mask_has_repl
+    n_arrow = int(to_arrow.sum())
+    if n_arrow > 0:
+        df_p.loc[to_arrow, "Description"] = (
+            df_p.loc[to_arrow, "Description"] + " >>> (" + df_p.loc[to_arrow, "Replacements"] + ")"
+        )
+    print(f"   ➕ Добавлено '>>> (...)' для {n_arrow} строк")
+
+    # 3.3) Добавляем !!! NOT STORED ANYMORE !!!
     mask_disc = df_p["PartNumber"].isin(disc_set)
-    to_not = mask_no_not & mask_disc
-    df_p.loc[to_not, "Description"] = df_p["Description"] + " !!! NOT STORED ANYMORE !!!"
+    to_not = (~has_not) & mask_disc
+    n_not = int(to_not.sum())
+    if n_not > 0:
+        df_p.loc[to_not, "Description"] = (
+            df_p.loc[to_not, "Description"] + " !!! NOT STORED ANYMORE !!!"
+        )
+    print(f"   ❌ Добавлено '!!! NOT STORED ANYMORE !!!' для {n_not} строк")
 
     # 4) Обновляем только изменившиеся строки
-    # Для этого перечитаем оригинальные описания ещё раз и сравним
-    df_orig = pd.read_sql(f"SELECT PartNumber, Description AS Orig FROM {PRICELIST_TABLE_NAME}", conn)
+    df_orig = pd.read_sql(
+        f"SELECT PartNumber, Description AS Orig FROM {PRICELIST_TABLE_NAME}",
+        conn
+    )
+    df_orig["PartNumber"] = df_orig["PartNumber"].map(norm_part)
+
     df_m = df_p.merge(df_orig, on="PartNumber", how="left")
     changed = df_m[df_m["Description"] != df_m["Orig"]][["Description", "PartNumber"]]
 
@@ -776,28 +793,259 @@ def enrich_descriptions_from_replacements():
         conn.commit()
         print(f"✍️ Описания обновлены: {len(changed)} строк.")
     else:
-        print("ℹ️ Описания не требуют обновления.")
+        print("ℹ️ Нет изменений в описаниях — ничего не обновляли.")
 
     conn.close()
+    print("✅ enrich_descriptions_from_replacements(): завершено.")
 
 # ------------------------------------------------------------
 # 📤 Экспорт (базовый пример)
 # ------------------------------------------------------------
 
-def export_basic_excel():
+def export_basic_excel(previous_excel_path: str | None = None):
+    """
+    Экспортирует текущий прайс в Excel:
+      - лист Price: все активные позиции + позиции из предыдущего прайса, которых нет в новом,
+                    с признаком IsActive (1 - есть в текущем, 0 - только в старом).
+      - лист GROUP_INDEX: сводная таблица Fgrp -> CatID (по активным позициям),
+                          чтобы этот файл можно было использовать как 'previous' в следующем месяце.
+    """
     ensure_folder_exists()
     now = datetime.now().strftime("%Y-%m-%d_%H-%M")
     out_path = os.path.join(FOLDER_PATH, f"volvo_price_export_{now}.xlsx")
+
     conn = sqlite3.connect(DATABASE_PATH)
-    df = pd.read_sql(f"""
-        SELECT PartNumber, Description, DiscountCode, GrossPrice, DealerStockPrice, UnitSort, FunctionGroup, ProductGroup, CatID
+
+    # --- 1) Загружаем текущий прайс из SQLite
+    df_curr = pd.read_sql(f"""
+        SELECT 
+            PartNumber, 
+            Description, 
+            DiscountCode, 
+            GrossPrice, 
+            DealerStockPrice, 
+            UnitSort, 
+            FunctionGroup, 
+            ProductGroup, 
+            CatID
         FROM {PRICELIST_TABLE_NAME}
     """, conn)
-    conn.close()
-    with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
-        df.to_excel(xw, index=False, sheet_name="Price")
-    print(f"📦 Экспортировано: {out_path}")
 
+    conn.close()
+
+    # Нормализованный артикул
+    df_curr["PartNumber_norm"] = df_curr["PartNumber"].map(norm_part)
+    df_curr["IsActive"] = 1  # активные позиции
+
+    # ---------------------------------------------------------------------------------------
+    # --- 2) Добавляем позиции из предыдущего прайса (если previous_excel_path передан)
+    #      и ВЖИВАЕМ их в базу volvo_price_list с IsActive=0
+    # ---------------------------------------------------------------------------------------
+
+    df_missing_out = pd.DataFrame()
+
+    def norm_colname(s: str) -> str:
+        return "".join(ch for ch in str(s).lower() if ch not in " _.\u00A0")
+
+    if previous_excel_path and os.path.isfile(previous_excel_path):
+        try:
+            print(f"📥 Читаем предыдущий прайс для добавления отсутствующих позиций:\n{previous_excel_path}")
+
+            df_prev = pd.read_excel(previous_excel_path, sheet_name=0)
+            if df_prev.empty:
+                print("⚠️ Предыдущий прайс пуст — пропускаем добавление старых позиций.")
+            else:
+                # --- 2.1) Ищем артикул + полезные колонки
+                norm_map = {norm_colname(c): c for c in df_prev.columns}
+
+                part_candidates = ["partnumber", "partno", "номер", "артикул"]
+                cat_candidates  = ["catid", "cat_id", "категория"]
+                desc_candidates = ["description", "descr", "наименование"]
+                fgrp_candidates = ["fgrp", "functiongroup"]
+                pg_candidates   = ["productgroup", "pg"]
+                unitsort_candidates = ["unitsort", "unit_sort", "unit"]
+                dc_candidates = ["discountcode", "dc", "discount_code", "кодскидки"]
+                gross_candidates = ["grossprice", "gross", "listprice", "цена", "прайс", "calcretail"]
+                dealer_candidates = ["dealerstockprice", "dsl", "dealerprice", "netprice", "ценадилера", "calcdsl"]
+
+                def pick(cands):
+                    for k in cands:
+                        nk = norm_colname(k)
+                        if nk in norm_map:
+                            return norm_map[nk]
+                    return None
+
+                part_col = pick(part_candidates)
+                cat_col = pick(cat_candidates)
+                desc_col = pick(desc_candidates)
+                fgrp_col = pick(fgrp_candidates)
+                pg_col = pick(pg_candidates)
+                unitsort_col = pick(unitsort_candidates)
+                dc_col = pick(dc_candidates)
+                gross_col = pick(gross_candidates)
+                dealer_col = pick(dealer_candidates)
+
+                if part_col is None:
+                    print("⚠️ Не найдена колонка с артикулом в предыдущем прайсе — пропускаем добавление старых позиций.")
+                else:
+                    # --- 2.2) Подготавливаем DataFrame из предыдущего прайса
+                    df_prev_clean = df_prev.copy()
+                    
+                    # Переименовываем колонки в стандартные имена
+                    rename_map = {}
+                    if part_col: rename_map[part_col] = "PartNumber_prev"
+                    if desc_col: rename_map[desc_col] = "Description_prev"
+                    if cat_col: rename_map[cat_col] = "CatID_prev"
+                    if fgrp_col: rename_map[fgrp_col] = "FunctionGroup_prev"
+                    if pg_col: rename_map[pg_col] = "ProductGroup_prev"
+                    if unitsort_col: rename_map[unitsort_col] = "UnitSort_prev"
+                    if dc_col: rename_map[dc_col] = "DiscountCode_prev"
+                    if gross_col: rename_map[gross_col] = "GrossPrice_prev"
+                    if dealer_col: rename_map[dealer_col] = "DealerStockPrice_prev"
+                    
+                    df_prev_clean = df_prev_clean.rename(columns=rename_map)
+                    
+                    # Нормализуем артикулы
+                    if "PartNumber_prev" in df_prev_clean.columns:
+                        df_prev_clean["PartNumber_norm"] = df_prev_clean["PartNumber_prev"].map(norm_part)
+                        df_prev_clean = df_prev_clean.dropna(subset=["PartNumber_norm"])
+                    
+                    # --- 2.3) Находим позиции, которые есть в предыдущем прайсе, но отсутствуют в текущем
+                    curr_partnums = set(df_curr["PartNumber_norm"].dropna())
+                    prev_partnums = set(df_prev_clean["PartNumber_norm"].dropna())
+                    missing_partnums = prev_partnums - curr_partnums
+                    
+                    if missing_partnums:
+                        df_missing = df_prev_clean[df_prev_clean["PartNumber_norm"].isin(missing_partnums)].copy()
+                        
+                        # Формируем df_missing_out с нужными колонками
+                        df_missing_out = pd.DataFrame()
+                        
+                        # Используем нормализованный артикул как основной
+                        if "PartNumber_norm" in df_missing.columns:
+                            df_missing_out["PartNumber"] = df_missing["PartNumber_norm"]
+                        elif "PartNumber_prev" in df_missing.columns:
+                            df_missing_out["PartNumber"] = df_missing["PartNumber_prev"].map(norm_part)
+                        else:
+                            print("⚠️ Не удалось найти колонку с артикулом в предыдущем прайсе.")
+                            df_missing_out = pd.DataFrame()
+                        
+                        if not df_missing_out.empty:
+                            # Остальные колонки - если есть в df_missing, используем, иначе заполняем None
+                            col_mapping = {
+                                "Description": "Description_prev",
+                                "DiscountCode": "DiscountCode_prev",
+                                "GrossPrice": "GrossPrice_prev",
+                                "DealerStockPrice": "DealerStockPrice_prev",
+                                "UnitSort": "UnitSort_prev",
+                                "FunctionGroup": "FunctionGroup_prev",
+                                "ProductGroup": "ProductGroup_prev",
+                                "CatID": "CatID_prev"
+                            }
+                            
+                            for target_col, source_col in col_mapping.items():
+                                if source_col in df_missing.columns:
+                                    df_missing_out[target_col] = df_missing[source_col]
+                                else:
+                                    df_missing_out[target_col] = None
+                            
+                            df_missing_out["IsActive"] = 0   # старый прайс → неактивные позиции
+                            
+                            # Удаляем строки с пустыми артикулами
+                            df_missing_out = df_missing_out.dropna(subset=["PartNumber"])
+                        
+                        print(f"   📋 Найдено отсутствующих позиций: {len(df_missing_out)}")
+                        
+                        # --- 2.4) ВЖИВАЕМ эти строки в базу volvo_price_list ---
+                        if not df_missing_out.empty:
+                            with sqlite3.connect(DATABASE_PATH) as conn_ins:
+                                # гарантируем колонку IsActive
+                                ensure_column_exists(PRICELIST_TABLE_NAME, "IsActive", "INTEGER", conn_ins)
+                                # to_sql с append: столбцы DataFrame – подмножество таблицы → остальные будут NULL
+                                df_missing_out.to_sql(
+                                    PRICELIST_TABLE_NAME,
+                                    conn_ins,
+                                    if_exists="append",
+                                    index=False
+                                )
+                            
+                            print(f"💾 Вставлено в базу старых позиций: {len(df_missing_out)} (IsActive=0).")
+                        else:
+                            print("ℹ️ Нет позиций для добавления в базу.")
+                    else:
+                        print("ℹ️ Все позиции из предыдущего прайса присутствуют в текущем — добавлять нечего.")
+
+        except Exception as e:
+            print(f"⚠️ Ошибка при чтении предыдущего прайса: {e}")
+
+    else:
+        print("ℹ️ previous_excel_path не задан или файл не найден — экспортируем только текущий прайс.")
+
+    # ---------------------------------------------------------------------------------------
+    # --- 3) Объединяем текущие + отсутствующие
+    # ---------------------------------------------------------------------------------------
+
+    cols_final = [
+        "PartNumber", "Description", "DiscountCode", "GrossPrice",
+        "DealerStockPrice", "UnitSort", "FunctionGroup", "ProductGroup",
+        "CatID", "IsActive"
+    ]
+
+    df_curr_out = df_curr[cols_final]
+
+    frames = [df_curr_out]
+
+    # Проверяем df_missing_out на наличие данных и нужных колонок
+    if not df_missing_out.empty and df_missing_out.dropna(how="all").shape[0] > 0:
+        # Убеждаемся, что все нужные колонки присутствуют
+        missing_cols = set(cols_final) - set(df_missing_out.columns)
+        if missing_cols:
+            # Добавляем отсутствующие колонки с None
+            for col in missing_cols:
+                df_missing_out[col] = None
+        frames.append(df_missing_out[cols_final])
+
+    df_price = pd.concat(frames, ignore_index=True)
+    # ---------------------------------------------------------------------------------------
+    # --- 4) Строим GROUP_INDEX по активным позициям
+    # ---------------------------------------------------------------------------------------
+
+    df_active = df_price[df_price["IsActive"] == 1]
+
+    # Используем только строки с CatID != '' и != None
+    df_active = df_active[
+        df_active["FunctionGroup"].notna()
+        & df_active["CatID"].notna()
+        & (df_active["CatID"].astype(str).str.strip() != "")
+    ]
+
+    # Исключаем SW/HW категории как “защищённые”
+    df_active = df_active[~df_active["CatID"].astype(str).isin(["1000", "4"])]
+
+    if not df_active.empty:
+        grp = (
+            df_active.groupby(["FunctionGroup", "CatID"])
+                     .size()
+                     .reset_index(name="Count")
+        )
+
+        # Для каждого Fgrp выбираем CatID с максимальным Count
+        idx = grp.groupby("FunctionGroup")["Count"].idxmax()
+        df_group_index = grp.loc[idx].copy()
+        df_group_index = df_group_index.sort_values("FunctionGroup")
+        df_group_index = df_group_index.rename(columns={"FunctionGroup": "Fgrp"})
+    else:
+        df_group_index = pd.DataFrame(columns=["Fgrp", "CatID", "Count"])
+
+    # ---------------------------------------------------------------------------------------
+    # --- 5) Пишем в Excel
+    # ---------------------------------------------------------------------------------------
+
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
+        df_price.to_excel(xw, index=False, sheet_name="Price")
+        df_group_index.to_excel(xw, index=False, sheet_name="GROUP_INDEX")
+
+    print(f"📦 Экспортировано: {out_path}")
 
 def analyze_price_calculation_issues():
     """
@@ -947,19 +1195,19 @@ def align_prices_with_reference_data(data_folder: str = "data", tolerance: float
 
 def compare_prices_with_data_files(data_folder: str = "data", tolerance: float = 0.01):
     """
-    Сравнивает рассчитанные DealerStockPrice с ценами из файлов в папке data.
+    Сравнивает рассчитанные DealerStockPrice с эталонными ценами из файлов в папке data.
     
-    Формула расчета: DealerStockPrice = GrossPrice * (1 - [Dealer Stock %]/100.0)
-    В файлах data колонка CalcDSl содержит эталонные значения.
+    Ожидается, что в Excel-файлах:
+      - артикул:  PartNo  (переименуем в PartNumber)
+      - эталон:  CalcDSl (переименуем в ReferencePrice)
     
-    Args:
-        data_folder: Путь к папке с файлами для сравнения
-        tolerance: Допустимое отклонение (по умолчанию 0.01 = 1 копейка)
-    
-    Returns:
-        DataFrame с результатами сравнения
+    НИЧЕГО НЕ МЕНЯЕТ в базе, только отчёт:
+      - статистика совпадений/расхождений,
+      - Excel-файл с топ-расхождениями.
     """
-    # Загружаем все файлы из папки data
+    import glob
+
+    # 1) Собираем эталонные данные из папки data
     data_files = glob.glob(os.path.join(data_folder, "*.xlsx"))
     if not data_files:
         print(f"❌ Файлы не найдены в папке {data_folder}")
@@ -967,34 +1215,36 @@ def compare_prices_with_data_files(data_folder: str = "data", tolerance: float =
     
     print(f"📂 Найдено файлов для сравнения: {len(data_files)}")
     
-    # Объединяем все файлы в один DataFrame
     all_data = []
     for file_path in sorted(data_files):
         try:
             df_file = pd.read_excel(file_path)
-            # Нормализуем названия колонок (могут быть разные варианты)
-            if 'PartNo' in df_file.columns:
-                df_file = df_file.rename(columns={'PartNo': 'PartNumber'})
-            if 'CalcDSl' in df_file.columns:
-                df_file = df_file.rename(columns={'CalcDSl': 'ReferencePrice'})
-            all_data.append(df_file[['PartNumber', 'ReferencePrice']].copy())
-            print(f"  ✓ Загружен: {os.path.basename(file_path)} ({len(df_file)} записей)")
+            # Нормализуем имена колонок
+            if "PartNo" in df_file.columns:
+                df_file = df_file.rename(columns={"PartNo": "PartNumber"})
+            if "CalcDSl" in df_file.columns:
+                df_file = df_file.rename(columns={"CalcDSl": "ReferencePrice"})
+            
+            if {"PartNumber", "ReferencePrice"} <= set(df_file.columns):
+                all_data.append(df_file[["PartNumber", "ReferencePrice"]].copy())
+                print(f"  ✓ {os.path.basename(file_path)}: {len(df_file)} строк")
+            else:
+                print(f"  ⚠️ Пропускаем {os.path.basename(file_path)} — нет нужных колонок")
         except Exception as e:
             print(f"  ✗ Ошибка при загрузке {os.path.basename(file_path)}: {e}")
     
     if not all_data:
-        print("❌ Не удалось загрузить данные из файлов")
+        print("❌ Не удалось собрать эталонные данные из файлов")
         return None
     
-    # Объединяем все данные
     df_reference = pd.concat(all_data, ignore_index=True)
-    df_reference['PartNumber'] = df_reference['PartNumber'].map(norm_part)
-    df_reference = df_reference.dropna(subset=['PartNumber', 'ReferencePrice'])
-    df_reference = df_reference.drop_duplicates('PartNumber', keep='first')
+    df_reference["PartNumber"] = df_reference["PartNumber"].map(norm_part)
+    df_reference = df_reference.dropna(subset=["PartNumber", "ReferencePrice"])
+    df_reference = df_reference.drop_duplicates("PartNumber", keep="first")
     
-    print(f"📊 Всего эталонных цен: {len(df_reference)}")
+    print(f"📊 Всего эталонных цен (уникальные PartNumber): {len(df_reference)}")
     
-    # Загружаем данные из базы
+    # 2) Достаём из БД то, что посчитали
     conn = sqlite3.connect(DATABASE_PATH)
     df_db = pd.read_sql(f"""
         SELECT 
@@ -1008,71 +1258,130 @@ def compare_prices_with_data_files(data_folder: str = "data", tolerance: float =
     """, conn)
     conn.close()
     
-    conn.close(); return
-
-    # Дополнительная проверка: не заполняем пустые CatID из Excel
-    upd = upd[upd["CatID"].notna() & (upd["CatID"].str.strip() != '')]
-    if upd.empty:
-        print("ℹ️ В предыдущем прайсе нет валидных CatID для дозаполнения.")
-        conn.close(); return
-
-    # Исключаем категорию SOFT (CatID='1000') из предыдущего прайса
-    # Категория SOFT должна определяться только по UnitSort='SW' на шаге 1, а не переноситься из старого прайса
-    upd = upd[upd["CatID"].str.strip() != '1000']
-    if upd.empty:
-        print("ℹ️ В предыдущем прайсе остались только категории SOFT, которые не переносятся.")
-        conn.close(); return
-
-    payload = list(map(tuple, upd[["CatID", "PartNumber"]].values))
-    cur.executemany(
-        f"UPDATE {PRICELIST_TABLE_NAME} SET CatID = ? WHERE PartNumber = ? AND {empty_condition}",
-        payload,
-    )
-    conn.commit(); conn.close()
-    print(f"✍️ Заполнено CatID из предыдущего прайса: {len(payload)} поз. (только пустые)")
-
-def apply_catid_overrides(force: bool = False):
-    """
-    Применяет ручные переопределения CatID.
-    По умолчанию НЕ перезаписывает непустые CatID (force=False).
-    Если нужно принудительно — вызови apply_catid_overrides(force=True).
+    df_db["PartNumber"] = df_db["PartNumber"].map(norm_part)
     
-    ВАЖНО: Не дублируй правила, которые уже обрабатываются в ensure_catid_by_pg()!
-    Используй эту функцию только для точечных переопределений по PartNumber
-    или для правил, которые не покрываются автоматическими методами.
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-
-    # ВАЖНО: Убраны дубликаты с ensure_catid_by_pg() (PG=15 и PG=25)
-    # Оставляем только точечные переопределения по PartNumber
-    overrides = [
-        # пример точечных артикулов:
-        # ("14", "PartNumber", "30657360"),
-        # ("20", "PartNumber", "12345678"),
-    ]
-
-    total = 0
-    for catid, column, value in overrides:
-        if force:
-            cur.execute(f"""
-                UPDATE {PRICELIST_TABLE_NAME}
-                SET CatID = ?
-                WHERE {column} = ?
-            """, (catid, value))
-        else:
-            cur.execute(f"""
-                UPDATE {PRICELIST_TABLE_NAME}
-                SET CatID = ?
-                WHERE {column} = ? AND {empty_condition}
-            """, (catid, value))
-        total += cur.rowcount
-    conn.commit(); conn.close()
-    if total > 0:
-        print(f"✅ Применены ручные переопределения CatID: {total} поз. ({'force' if force else 'только пустые'})")
+    # 3) Склеиваем и считаем расхождения
+    df_compare = df_db.merge(df_reference, on="PartNumber", how="inner")
+    if df_compare.empty:
+        print("⚠️ Не удалось сопоставить ни одного артикула по PartNumber.")
+        return None
+    
+    df_compare["Difference"] = df_compare["DealerStockPrice"] - df_compare["ReferencePrice"]
+    df_compare["AbsDiff"] = df_compare["Difference"].abs()
+    
+    total = len(df_compare)
+    ok = (df_compare["AbsDiff"] <= tolerance).sum()
+    bad = total - ok
+    
+    print("\n🔍 Сравнение DealerStockPrice vs ReferencePrice:")
+    print(f"  Всего сопоставлено: {total}")
+    print(f"  В пределах допуска (≤ {tolerance}): {ok}")
+    print(f"  С расхождением > {tolerance}: {bad}")
+    
+    mismatches = df_compare[df_compare["AbsDiff"] > tolerance].copy()
+    if not mismatches.empty:
+        mismatches_sorted = mismatches.sort_values("AbsDiff", ascending=False).head(100)
+        ensure_folder_exists()
+        out_path = os.path.join(FOLDER_PATH, "dealer_price_mismatches.xlsx")
+        mismatches_sorted.to_excel(out_path, index=False)
+        print(f"  ⚠️ Топ расхождений сохранён в: {out_path}")
     else:
-        print(f"ℹ️ Ручные переопределения CatID: нет правил для применения.")
+        print("  ✅ Все цены в пределах допуска.")
+    
+    return df_compare
+
+
+# Функция apply_catid_overrides теперь импортируется из CatID_lib
+
+def export_catid_quality_report():
+    """
+    Делает базовый отчёт по качеству заполнения CatID:
+      - распределение по ProductGroup (PG → CatID)
+      - распределение по FunctionGroup (Fgrp → CatID)
+      - нарушения правил для UnitSort (SW/HW)
+      - список позиций с пустым CatID (если остались)
+    Всё сохраняется в один Excel в папку export/.
+    """
+    ensure_folder_exists()
+    report_path = os.path.join(FOLDER_PATH, "catid_quality_report.xlsx")
+
+    conn = sqlite3.connect(DATABASE_PATH)
+
+    # --- 1) Распределение по ProductGroup (PG → CatID)
+    df_pg = pd.read_sql(f"""
+        SELECT 
+            ProductGroup,
+            CatID,
+            COUNT(*) AS Count
+        FROM {PRICELIST_TABLE_NAME}
+        GROUP BY ProductGroup, CatID
+        ORDER BY ProductGroup, Count DESC
+    """, conn)
+
+    if not df_pg.empty:
+        # проценты внутри каждого PG
+        df_pg["TotalInPG"] = df_pg.groupby("ProductGroup")["Count"].transform("sum")
+        df_pg["PercentInPG"] = (df_pg["Count"] / df_pg["TotalInPG"] * 100).round(2)
+
+    # --- 2) Распределение по FunctionGroup (Fgrp → CatID)
+    df_fgrp = pd.read_sql(f"""
+        SELECT 
+            FunctionGroup AS Fgrp,
+            CatID,
+            COUNT(*) AS Count
+        FROM {PRICELIST_TABLE_NAME}
+        GROUP BY FunctionGroup, CatID
+        ORDER BY Fgrp, Count DESC
+    """, conn)
+
+    if not df_fgrp.empty:
+        df_fgrp["TotalInFgrp"] = df_fgrp.groupby("Fgrp")["Count"].transform("sum")
+        df_fgrp["PercentInFgrp"] = (df_fgrp["Count"] / df_fgrp["TotalInFgrp"] * 100).round(2)
+
+    # --- 3) Нарушения правил для UnitSort (SW/HW)
+    df_unitsort_mismatch = pd.read_sql(f"""
+        SELECT 
+            PartNumber,
+            Description,
+            ProductGroup,
+            FunctionGroup AS Fgrp,
+            UnitSort,
+            CatID
+        FROM {PRICELIST_TABLE_NAME}
+        WHERE 
+            (UnitSort = 'SW' AND (CatID IS NULL OR TRIM(COALESCE(CatID, '')) <> '1000'))
+            OR
+            (UnitSort = 'HW' AND (CatID IS NULL OR TRIM(COALESCE(CatID, '')) <> '4'))
+    """, conn)
+
+    # --- 4) Пустые CatID (если остались)
+    empty_condition = get_empty_catid_condition()
+    df_empty = pd.read_sql(f"""
+        SELECT 
+            PartNumber,
+            Description,
+            ProductGroup,
+            FunctionGroup AS Fgrp,
+            UnitSort,
+            CatID
+        FROM {PRICELIST_TABLE_NAME}
+        WHERE {empty_condition}
+    """, conn)
+
+    conn.close()
+
+    # --- Запись в Excel
+    with pd.ExcelWriter(report_path, engine="xlsxwriter") as writer:
+        if not df_pg.empty:
+            df_pg.to_excel(writer, sheet_name="PG_vs_CatID", index=False)
+        if not df_fgrp.empty:
+            df_fgrp.to_excel(writer, sheet_name="Fgrp_vs_CatID", index=False)
+        if not df_unitsort_mismatch.empty:
+            df_unitsort_mismatch.to_excel(writer, sheet_name="UnitSort_mismatch", index=False)
+        if not df_empty.empty:
+            df_empty.to_excel(writer, sheet_name="Empty_CatID", index=False)
+
+    print(f"📊 Отчёт по CatID сохранён: {report_path}")
 
 # ------------------------------------------------------------
 # 🚀 Пайплайн
@@ -1161,111 +1470,219 @@ def import_volvo_prices_txt():
     ensure_indexes()  # после импорта точно создадим индексы
 
 
-def backfill_catid_from_previous_excel(excel_path: str | None = None):
-    """Дозаполняет CatID из предыдущего прайса (Excel), сопоставление по PartNumber.
-    Имена колонок распознаются устойчиво: регистр не важен, пробелы/подчёркивания/точки/неразрывные пробелы игнорируются.
-    Поддерживаемые варианты:
-      • Артикул: PartNumber, PartNo, Part No, Part_Number, Артикул, Номер
-      • Категория: CatID, Cat_ID, Cat Id, Category1C, Category, Категория
+# Функция backfill_catid_from_previous_excel теперь импортируется из CatID_lib
+
+def calculate_prices_and_export_eur_for_1c(export_filename_eur: str | None = None):
     """
-    import pandas as pd
-    from tkinter import filedialog
+    Пайплайн как в processing.py, но с EUR:
 
-    def norm_colname(s: str) -> str:
-        # к нижнему регистру и выкинуть пробелы/подчёркивания/точки/неразрывные пробелы
-        return "".join(ch for ch in s.lower() if ch not in " _. ")
+    1) В SEK считаем:
+       - CalcDSl  (из DealerStockPrice)
+       - CostFactor (по CatID)
+       - SelfCost
+       - Margin (по SelfCost и CatID)
+       - RetailPrice
+       - Category1C (по CatID → 1С-код)
 
-    # 1) выбрать файл
-    default_candidate = os.path.abspath("previous_prices.xlsx")
-    if excel_path is None:
-        if os.path.isfile(default_candidate):
-            excel_path = default_candidate
-        else:
-            print("📄 Выберите предыдущий прайс (Excel) для подтягивания CatID…")
-            excel_path = filedialog.askopenfilename(
-                title="Выберите предыдущий прайс (Excel)",
-                filetypes=[("Excel files", "*.xlsx;*.xlsm;*.xls")],
-            )
-            if not excel_path:
-                print("⛔ Файл не выбран, пропускаем backfill CatID.")
-                return
+    2) Потом считаем EUR-колонки:
+       - CalcDSl_EUR     = CEIL((CalcDSl     / EUR_RATE) * 100) / 100
+       - SelfCost_EUR    = CEIL((SelfCost    / EUR_RATE) * 100) / 100
+       - RetailPrice_EUR = CEIL((RetailPrice / EUR_RATE) * 100) / 100
 
-    if not os.path.isfile(excel_path):
-        print(f"⛔ Файл не найден: {excel_path}")
-        return
+    3) Экспортируем финальный прайс в EUR под 1С.
+    """
+    ensure_folder_exists()
 
-    print(f"📥 Читаем предыдущий прайс: {excel_path}")
-    try:
-        df_prev = pd.read_excel(excel_path)
-    except Exception as e:
-        print("⛔ Не удалось прочитать Excel:", e)
-        return
+    if export_filename_eur is None:
+        now = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        export_filename_eur = f"volvo_price_export_EUR_{now}.xlsx"
 
-    if df_prev.empty:
-        print("⛔ Файл пустой.")
-        return
-
-    # 2) карта нормализованных имён → оригинальные
-    norm_map = {norm_colname(c): c for c in df_prev.columns}
-
-    part_candidates = [
-        "partnumber", "partno", "part_number", "part no", "номер", "артикул"
-    ]
-    cat_candidates = [
-        "catid", "cat_id", "cat id", "category1c", "category", "категория"
-    ]
-
-    part_col = next((norm_map.get(norm_colname(k)) for k in part_candidates if norm_colname(k) in norm_map), None)
-    cat_col  = next((norm_map.get(norm_colname(k)) for k in cat_candidates  if norm_colname(k) in norm_map), None)
-
-    if part_col is None or cat_col is None:
-        print("⛔ Не удалось найти нужные колонки в предыдущем прайсе.")
-        print("   Доступные колонки:", list(df_prev.columns))
-        print("   Ищем PartNumber среди:", part_candidates)
-        print("   Ищем CatID среди:", cat_candidates)
-        return
-
-    # 3) привести к двум колонкам и нормализовать
-    df_prev = df_prev[[part_col, cat_col]].copy()
-    df_prev.columns = ["PartNumber", "CatID"]
-    df_prev["PartNumber"] = df_prev["PartNumber"].map(norm_part)
-    df_prev["CatID"] = df_prev["CatID"].astype(str).str.strip()
-    df_prev = df_prev.dropna(subset=["PartNumber", "CatID"]).drop_duplicates("PartNumber")
-
-    # 4) выбрать кого дозаполнять (только пустые CatID)
     conn = sqlite3.connect(DATABASE_PATH)
+    conn.create_function("CEIL", 1, lambda x: math.ceil(float(x)) if x is not None else None)
     cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-    cur.execute(f"SELECT PartNumber FROM {PRICELIST_TABLE_NAME} WHERE {empty_condition}")
-    missing_parts = {row[0] for row in cur.fetchall()}
 
-    # Фильтруем только те артикулы, у которых CatID пустой
-    upd = df_prev[df_prev["PartNumber"].isin(missing_parts)]
-    if upd.empty:
-        print("ℹ️ Нет позиций для дозаполнения CatID из предыдущего прайса.")
-        conn.close(); return
+    # --- 0) Гарантируем, что все нужные колонки существуют ---
+    ensure_column_exists(PRICELIST_TABLE_NAME, "CalcDSl",         "REAL", conn)  # инвойс в SEK
+    ensure_column_exists(PRICELIST_TABLE_NAME, "SelfCost",        "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "RetailPrice",     "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "Margin",          "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "CostFactor",      "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "Category1C",      "TEXT", conn)
 
-    # Дополнительная проверка: не заполняем пустые CatID из Excel
-    upd = upd[upd["CatID"].notna() & (upd["CatID"].str.strip() != '')]
-    if upd.empty:
-        print("ℹ️ В предыдущем прайсе нет валидных CatID для дозаполнения.")
-        conn.close(); return
+    ensure_column_exists(PRICELIST_TABLE_NAME, "CalcDSl_EUR",     "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "SelfCost_EUR",    "REAL", conn)
+    ensure_column_exists(PRICELIST_TABLE_NAME, "RetailPrice_EUR", "REAL", conn)
 
-    # Исключаем категорию SOFT (CatID='1000') из предыдущего прайса
-    # Категория SOFT должна определяться только по UnitSort='SW' на шаге 1, а не переноситься из старого прайса
-    upd = upd[upd["CatID"].str.strip() != '1000']
-    if upd.empty:
-        print("ℹ️ В предыдущем прайсе остались только категории SOFT, которые не переносятся.")
-        conn.close(); return
+    # --- 1) CalcDSl (SEK) ← DealerStockPrice ---
+    # Можно перетирать всегда: это рабочая производная колонка
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET CalcDSl = DealerStockPrice
+        WHERE DealerStockPrice IS NOT NULL
+    """)
+    conn.commit()
 
-    payload = list(map(tuple, upd[["CatID", "PartNumber"]].values))
-    cur.executemany(
-        f"UPDATE {PRICELIST_TABLE_NAME} SET CatID = ? WHERE PartNumber = ? AND {empty_condition}",
-        payload,
-    )
-    conn.commit(); conn.close()
-    print(f"✍️ Заполнено CatID из предыдущего прайса: {len(payload)} поз. (только пустые)")
+    # --- 2) CostFactor по CatID ---
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET CostFactor = CASE
+            WHEN CatID = '1000' THEN 1.25  -- SW
+            ELSE 1.55                      -- всё остальное
+        END
+        WHERE CalcDSl IS NOT NULL
+    """)
+    conn.commit()
 
+    # --- 3) SelfCost (SEK) ---
+    # как в processing.py — считаем в SEK без CEIL, округляем до 0.001
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET SelfCost = ROUND(CalcDSl * CostFactor, 3)
+        WHERE CalcDSl IS NOT NULL AND CostFactor IS NOT NULL
+    """)
+    conn.commit()
+
+    # --- 4) Margin для ПО (CatID='1000') по SelfCost (SEK) ---
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET Margin = CASE
+            WHEN SelfCost < 100  THEN 0.50
+            WHEN SelfCost < 200  THEN 0.40
+            WHEN SelfCost < 400  THEN 0.35
+            WHEN SelfCost < 600  THEN 0.30
+            WHEN SelfCost < 1000 THEN 0.25
+            ELSE 0.22
+        END
+        WHERE CatID = '1000' AND SelfCost IS NOT NULL
+    """)
+    conn.commit()
+
+    # --- 5) Margin для остальных CatID по SelfCost (SEK) ---
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET Margin = (
+            CASE 
+                WHEN SelfCost <   20 THEN 0.50
+                WHEN SelfCost <   40 THEN 0.49
+                WHEN SelfCost <   60 THEN 0.48
+                WHEN SelfCost <   80 THEN 0.47
+                WHEN SelfCost <  100 THEN 0.46
+                WHEN SelfCost <  120 THEN 0.45
+                WHEN SelfCost <  140 THEN 0.45
+                WHEN SelfCost <  160 THEN 0.44
+                WHEN SelfCost <  180 THEN 0.44
+                WHEN SelfCost <  200 THEN 0.43
+                WHEN SelfCost <  220 THEN 0.43
+                WHEN SelfCost <  240 THEN 0.42
+                WHEN SelfCost <  260 THEN 0.42
+                WHEN SelfCost <  280 THEN 0.42
+                WHEN SelfCost <  300 THEN 0.41
+                WHEN SelfCost <  330 THEN 0.41
+                WHEN SelfCost <  360 THEN 0.41
+                WHEN SelfCost <  390 THEN 0.41
+                WHEN SelfCost <  420 THEN 0.40
+                WHEN SelfCost <  450 THEN 0.40
+                WHEN SelfCost <  480 THEN 0.40
+                WHEN SelfCost <  510 THEN 0.40
+                WHEN SelfCost <  560 THEN 0.40
+                WHEN SelfCost <  610 THEN 0.40
+                WHEN SelfCost <  680 THEN 0.40
+                WHEN SelfCost <  750 THEN 0.39
+                WHEN SelfCost <  850 THEN 0.39
+                WHEN SelfCost <  950 THEN 0.39
+                WHEN SelfCost < 1050 THEN 0.39
+                WHEN SelfCost < 1200 THEN 0.39
+                WHEN SelfCost < 1400 THEN 0.39
+                WHEN SelfCost < 1700 THEN 0.39
+                WHEN SelfCost < 2100 THEN 0.39
+                WHEN SelfCost < 2600 THEN 0.38
+                WHEN SelfCost < 3300 THEN 0.38
+                WHEN SelfCost < 4100 THEN 0.38
+                WHEN SelfCost < 5000 THEN 0.38
+                WHEN SelfCost < 6000 THEN 0.38
+                WHEN SelfCost < 7500 THEN 0.38
+                WHEN SelfCost < 9500 THEN 0.38
+                WHEN SelfCost < 11000 THEN 0.38
+                WHEN SelfCost < 15000 THEN 0.38
+                ELSE 0.37
+            END
+        )
+        WHERE (CatID IS NULL OR CatID <> '1000') AND SelfCost IS NOT NULL
+    """)
+    conn.commit()
+
+    # --- 6) RetailPrice (SEK) ---
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET RetailPrice = ROUND(SelfCost / (1 - Margin), 2)
+        WHERE SelfCost IS NOT NULL AND Margin IS NOT NULL
+    """)
+    conn.commit()
+
+    # --- 7) Category1C по CatID (1С-код) ---
+    for cat_id, code_1c in CATEGORY_MAPPING_1C.items():
+        cur.execute(f"""
+            UPDATE {PRICELIST_TABLE_NAME}
+            SET Category1C = ?
+            WHERE CatID = ?
+        """, (code_1c, str(cat_id)))
+    conn.commit()
+
+    # --- 8) Конвертация в EUR с CEIL до +0.01 ---
+    # Инвойс (CalcDSl_EUR)
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET CalcDSl_EUR = CAST(CEIL((CalcDSl / ?) * 100) AS REAL) / 100.0
+        WHERE CalcDSl IS NOT NULL
+    """, (EUR_TO_SEK_RATE,))
+    conn.commit()
+
+    # Себестоимость (SelfCost_EUR)
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET SelfCost_EUR = CAST(CEIL((SelfCost / ?) * 100) AS REAL) / 100.0
+        WHERE SelfCost IS NOT NULL
+    """, (EUR_TO_SEK_RATE,))
+    conn.commit()
+
+    # Розница (RetailPrice_EUR)
+    cur.execute(f"""
+        UPDATE {PRICELIST_TABLE_NAME}
+        SET RetailPrice_EUR = CAST(CEIL((RetailPrice / ?) * 100) AS REAL) / 100.0
+        WHERE RetailPrice IS NOT NULL
+    """, (EUR_TO_SEK_RATE,))
+    conn.commit()
+
+    # --- 9) Подготовка DataFrame для экспорта ---
+    df_prices = pd.read_sql_query(f"""
+        SELECT
+            PartNumber      AS "Part Number",
+            Description     AS "Наименование товара",
+            CalcDSl_EUR     AS "Инвойсная цена в Евро (по курсу конвертации производителя)",
+            CostFactor      AS "Расчетный коэффициент входа",
+            SelfCost_EUR    AS "Расчетная себестоимость в Евро",
+            RetailPrice_EUR AS "Розница с НДС в Евро по схеме расчета розничной цены для клиента",
+            Category1C      AS "Категория 1C"
+        FROM {PRICELIST_TABLE_NAME}
+        WHERE CalcDSl_EUR IS NOT NULL
+    """, conn)
+
+    export_path = os.path.join(FOLDER_PATH, export_filename_eur)
+    with pd.ExcelWriter(export_path, engine="xlsxwriter") as writer:
+        df_prices.to_excel(writer, sheet_name="Price List EUR", index=False)
+
+        # формат для денег с двумя знаками
+        workbook  = writer.book
+        worksheet = writer.sheets["Price List EUR"]
+        money_fmt = workbook.add_format({'num_format': '#,##0.00'})
+
+        # C, E, F — колонны с EUR-ценами (если порядок поменяешь — поправь буквы)
+        worksheet.set_column('C:C', 22, money_fmt)  # инвойс EUR
+        worksheet.set_column('E:E', 22, money_fmt)  # себестоимость EUR
+        worksheet.set_column('F:F', 22, money_fmt)  # розница EUR
+
+    conn.close()
+    print(f"📦 Экспортировано EUR-прайс для 1С: {export_path}")
 
 def postprocess_prices():
     # Редактор скидок (блокирующая форма)
@@ -1309,11 +1726,11 @@ def postprocess_prices():
         13: '60',   # CHEMICALS
         16: '10',   # TYRES
         18: '65',   # SPECIAL TOOLS
-        17: '70',   # (1396 записей, но CatID=1000 определяется по UnitSort='SW')
+    #    17: '70',   # (1396 записей, но CatID=1000 определяется по UnitSort='SW')
         21: '70',   # (71 запись, 94.4% имеют CatID=70)
-        24: '65',   # (1 запись, 100% имеют CatID=65)
-        54: '65',   # (1 запись, 100% имеют CatID=65)
-        55: '70',   # (219 записей, 28.3% имеют CatID=70 - самая частая)
+    #    24: '65',   # (1 запись, 100% имеют CatID=65)
+    #    54: '65',   # (1 запись, 100% имеют CatID=65)
+    #    55: '70',   # (219 записей, 28.3% имеют CatID=70 - самая частая)
         56: '10'    # (90 записей, 100% имеют CatID=10)
     })
     print_catid_statistics("После шага 2 (PG)")
@@ -1326,7 +1743,8 @@ def postprocess_prices():
 
     # 4) Наследование из предыдущего Excel (самое «остаточное», самый низкий приоритет)
     #    Заполняет только те CatID, которые остались пустыми после всех предыдущих шагов
-    backfill_catid_from_previous_excel()
+    prev_excel_path = backfill_catid_from_previous_excel()
+
     print_catid_statistics("После шага 4 (Excel backfill)")
 
     # Стоимость дилера
@@ -1345,8 +1763,13 @@ def postprocess_prices():
     # Описания: >>>(...) и !!! NOT STORED ANYMORE !!!
     enrich_descriptions_from_replacements()
 
+    # Отчёт по качеству CatID
+    export_catid_quality_report()
+
     # Экспорт (базовый)
-    export_basic_excel()
+    export_basic_excel(previous_excel_path=prev_excel_path)
+
+    calculate_prices_and_export_eur_for_1c()
 
     print("✅ Пост-обработка завершена.")
 
