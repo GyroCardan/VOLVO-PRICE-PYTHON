@@ -12,13 +12,29 @@ import math  # 👈 добавь к импортам, если ещё нет
 from CatID_lib import (
     ensure_catid_soft,
     ensure_catid_hardware,
-    ensure_catid_by_pg,
     apply_catid_overrides,
     backfill_catid_from_previous_excel,
     print_catid_statistics,
     get_empty_catid_condition,
     get_catid_statistics,
     norm_part,
+    # Правила ProductGroup (централизованные)
+    apply_pg_rules,
+    # Функции для работы с матрицей Fgrp -> CatID
+    sync_new_fgrp_to_table,
+    import_fgrp_matrix_from_excel,
+    ensure_catid_by_fgrp,
+    export_fgrp_matrix_to_excel,
+    edit_fgrp_matrix_interactive,
+    ensure_fgrp_table_exists,
+    fill_fgrp_matrix_from_current_prices,
+    # Константы
+    FGRP_TABLE_NAME,
+    # Анализ распределения CatID
+    analyze_fgrp_catid_distribution,
+    # Диагностика источника CatID
+    diagnose_catid_source,
+    trace_pg_catid_source,
 )
 
 # ...
@@ -658,8 +674,6 @@ def ensure_column_exists(table: str, column: str, column_type: str, conn: sqlite
 #   18 — SPECIAL TOOLS
 #   25 — MERCHANDISE
 # ------------------------------------------------------------
-
-# Функция ensure_catid_by_pg теперь импортируется из CatID_lib
 
 # --- Обогащение описаний: >>>(...) и метка снято с производства ---
 
@@ -1716,36 +1730,187 @@ def postprocess_prices():
     # ------------------------------------------------------------
     # 2) Правила по ProductGroup (детерминированные, но менее специфичные)
     #    Заполняет только те CatID, которые остались пустыми после шага 1
-    #    PG=11 (PARTS) → CatID='70' (самая частая категория для запчастей)
-    #    PG=14 (EXCHANGE) → CatID='40' (самая частая категория для обменных узлов)
-    ensure_catid_by_pg({
-        11: '70',   # PARTS - самая частая категория
-        14: '40',   # EXCHANGE - самая частая категория
-        15: '20',   # ACCESSORIES
-        25: '80',   # MERCHANDISE
-        13: '60',   # CHEMICALS
-        16: '10',   # TYRES
-        18: '65',   # SPECIAL TOOLS
-    #    17: '70',   # (1396 записей, но CatID=1000 определяется по UnitSort='SW')
-        21: '70',   # (71 запись, 94.4% имеют CatID=70)
-    #    24: '65',   # (1 запись, 100% имеют CatID=65)
-    #    54: '65',   # (1 запись, 100% имеют CatID=65)
-    #    55: '70',   # (219 записей, 28.3% имеют CatID=70 - самая частая)
-        56: '10'    # (90 записей, 100% имеют CatID=10)
-    })
+    #    Все правила централизованы в CatID_lib.py
+    apply_pg_rules()
     print_catid_statistics("После шага 2 (PG)")
 
-    # 3) Ручные точечные переопределения (только для специфичных артикулов)
-    #    ВАЖНО: Не дублирует правила из шага 2! Используй только для PartNumber.
-    #    Заполняет только те CatID, которые остались пустыми после шагов 1-2
-    apply_catid_overrides(force=False)
-    print_catid_statistics("После шага 3 (Overrides)")
+    # 3) Синхронизация новых FunctionGroup (без применения матрицы пока)
+    #    Добавляем новые Fgrp в таблицу fgrp_category с CatID=NULL
+    sync_new_fgrp_to_table()
 
-    # 4) Наследование из предыдущего Excel (самое «остаточное», самый низкий приоритет)
+    # 4) Ручные точечные переопределения (только для специфичных артикулов)
+    #    ВАЖНО: Не дублирует правила из шага 2! Используй только для PartNumber.
+    #    Заполняет только те CatID, которые остались пустыми после шагов 1-3
+    apply_catid_overrides(force=False)
+    print_catid_statistics("После шага 4 (Overrides)")
+
+    # 5) Наследование из предыдущего Excel (самое «остаточное», самый низкий приоритет)
     #    Заполняет только те CatID, которые остались пустыми после всех предыдущих шагов
     prev_excel_path = backfill_catid_from_previous_excel()
 
-    print_catid_statistics("После шага 4 (Excel backfill)")
+    print_catid_statistics("После шага 5 (Excel backfill)")
+
+    # 6) Матрица Fgrp -> CatID (после backfill, чтобы использовать заполненные CatID)
+    # ВАЖНО: Сохраняем начальное состояние матрицы ДО любых операций для корректного сравнения изменений
+    ensure_fgrp_table_exists()
+    conn = sqlite3.connect(DATABASE_PATH)
+    df_initial_matrix = pd.read_sql(f"SELECT Fgrp, CatID FROM {FGRP_TABLE_NAME}", conn)
+    initial_matrix_dict = {}
+    for _, row in df_initial_matrix.iterrows():
+        fgrp = int(row["Fgrp"])
+        catid = str(row["CatID"]).strip() if pd.notna(row["CatID"]) else None
+        initial_matrix_dict[fgrp] = catid if catid and catid != "" else None
+    conn.close()
+    
+    # a) Заполняем матрицу на основе текущих значений CatID в прайсе
+    #    (используем самые частые CatID для каждого FunctionGroup)
+    print("\n📊 Заполняем матрицу Fgrp -> CatID на основе текущих значений в прайсе...")
+    fill_fgrp_matrix_from_current_prices(only_empty=True)  # заполняем только пустые в матрице
+    
+    # b) Опциональное редактирование матрицы
+    ensure_fgrp_table_exists()
+    conn = sqlite3.connect(DATABASE_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT COUNT(*) FROM {FGRP_TABLE_NAME} WHERE CatID IS NULL")
+        empty_fgrp_count = cur.fetchone()[0]
+        
+        cur.execute(f"SELECT COUNT(*) FROM {FGRP_TABLE_NAME}")
+        total_fgrp_count = cur.fetchone()[0]
+    finally:
+        conn.close()
+    
+    # Предлагаем редактирование матрицы
+    if empty_fgrp_count > 0:
+        print(f"\n⚠️ Обнаружено {empty_fgrp_count} из {total_fgrp_count} FunctionGroup с пустым CatID в матрице.")
+        print("   Рекомендуется заполнить матрицу Fgrp -> CatID перед применением.")
+    else:
+        print(f"\n✅ Матрица Fgrp -> CatID: все {total_fgrp_count} FunctionGroup имеют CatID.")
+    
+    print("\n   Варианты редактирования матрицы:")
+    print("   - 'y' или Enter: редактировать матрицу интерактивно (откроется Excel)")
+    print("   - 'e': экспортировать матрицу в Excel для ручного редактирования")
+    print("   - 'n': пропустить редактирование и применить текущую матрицу")
+    response = input("   Ваш выбор (y/e/n, по умолчанию y): ").strip().lower()
+    
+    changed_fgrps_after_edit = None  # Список изменённых fgrp после редактирования
+    
+    if response == 'e':
+        # Экспортируем матрицу для ручного редактирования
+        excel_path = export_fgrp_matrix_to_excel()
+        print(f"\n📤 Матрица экспортирована: {excel_path}")
+        print("   Отредактируйте файл и затем импортируйте через:")
+        print(f"   import_fgrp_matrix_from_excel('{excel_path}')")
+        input("   Нажмите Enter после редактирования и импорта...")
+        # После ручного редактирования нужно импортировать изменения
+        # ВАЖНО: Используем начальное состояние матрицы для корректного сравнения
+        print("\n📥 Импортируем изменения из отредактированного файла...")
+        changed_fgrps_after_edit = import_fgrp_matrix_from_excel(
+            excel_path, mode="fill", initial_matrix_dict=initial_matrix_dict
+        )
+    elif response != 'n':
+        # Интерактивное редактирование (по умолчанию)
+        # ВАЖНО: edit_fgrp_matrix_interactive() уже применяет изменения к прайсу внутри себя,
+        # поэтому после неё не нужно вызывать ensure_catid_by_fgrp() повторно
+        print("\n📝 Запускаем редактор матрицы Fgrp -> CatID...")
+        edit_fgrp_matrix_interactive()
+        # После edit_fgrp_matrix_interactive() изменения уже применены, пропускаем повторное применение
+        changed_fgrps_after_edit = []  # Пустой список означает, что изменения уже применены
+    else:
+        print("   Пропускаем редактирование матрицы. Применяем текущую матрицу.")
+    
+    # c) Применяем матрицу Fgrp -> CatID к прайсу
+    # Если матрица была отредактирована через edit_fgrp_matrix_interactive(), изменения уже применены
+    if changed_fgrps_after_edit is not None and len(changed_fgrps_after_edit) == 0:
+        # Изменения уже применены через edit_fgrp_matrix_interactive()
+        print("ℹ️ Матрица уже применена к прайсу через интерактивный редактор.")
+    elif changed_fgrps_after_edit and len(changed_fgrps_after_edit) > 0:
+        # Были изменения при ручном редактировании - применяем с учётом изменённых fgrp
+        print(f"\n🔄 Применяем матрицу с учётом изменённых Fgrp ({len(changed_fgrps_after_edit)} шт.)...")
+        ensure_catid_by_fgrp(mode="fill", changed_fgrps=changed_fgrps_after_edit)
+    else:
+        # Стандартный режим fill - только пустые CatID
+        ensure_catid_by_fgrp(mode="fill")
+    
+    # d) Проверяем несоответствия между матрицей и прайсом
+    print("\n🔍 Проверяем несоответствия между матрицей и прайсом...")
+    conn = sqlite3.connect(DATABASE_PATH)
+    empty_condition = get_empty_catid_condition()
+    
+    # Находим fgrp, где в прайсе CatID не соответствует матрице
+    # ВАЖНО: используем p.CatID вместо empty_condition, т.к. в JOIN нужен префикс таблицы
+    mismatches_query = f"""
+        SELECT DISTINCT
+            p.FunctionGroup AS Fgrp,
+            f.CatID AS MatrixCatID,
+            p.CatID AS ActualCatID,
+            COUNT(*) AS MismatchCount
+        FROM {PRICELIST_TABLE_NAME} p
+        INNER JOIN {FGRP_TABLE_NAME} f ON f.Fgrp = p.FunctionGroup
+        WHERE p.FunctionGroup IS NOT NULL
+          AND f.CatID IS NOT NULL
+          AND NOT (p.CatID IS NULL OR TRIM(COALESCE(p.CatID, '')) = '')
+          AND TRIM(COALESCE(p.CatID, '')) != ''
+          AND TRIM(COALESCE(f.CatID, '')) != ''
+          AND TRIM(COALESCE(p.CatID, '')) != TRIM(COALESCE(f.CatID, ''))
+        GROUP BY p.FunctionGroup, f.CatID, p.CatID
+        ORDER BY MismatchCount DESC
+        LIMIT 20
+    """
+    df_mismatches = pd.read_sql(mismatches_query, conn)
+    conn.close()
+    
+    if not df_mismatches.empty:
+        print(f"\n⚠️ Обнаружено {len(df_mismatches)} Fgrp с несоответствиями между матрицей и прайсом:")
+        for _, row in df_mismatches.iterrows():
+            try:
+                fgrp_val = int(float(row['Fgrp'])) if pd.notna(row['Fgrp']) else None
+                mismatch_count = int(float(row['MismatchCount'])) if pd.notna(row['MismatchCount']) else 0
+                matrix_catid = str(row['MatrixCatID']).strip() if pd.notna(row['MatrixCatID']) else 'None'
+                actual_catid = str(row['ActualCatID']).strip() if pd.notna(row['ActualCatID']) else 'None'
+                if fgrp_val is not None:
+                    print(f"   Fgrp={fgrp_val}: матрица → {matrix_catid}, прайс → {actual_catid} ({mismatch_count} поз.)")
+            except (ValueError, TypeError) as e:
+                print(f"   ⚠️ Ошибка при обработке строки: {e}")
+                continue
+        
+        # Получаем уникальные fgrp и корректно преобразуем в int
+        mismatched_fgrps = []
+        try:
+            unique_fgrps = df_mismatches['Fgrp'].dropna().unique()
+            for f in unique_fgrps:
+                try:
+                    f_int = int(float(f))  # Сначала float, потом int для обработки NaN
+                    if f_int not in mismatched_fgrps:
+                        mismatched_fgrps.append(f_int)
+                except (ValueError, TypeError):
+                    continue
+            
+            if mismatched_fgrps:
+                print(f"\n❓ Применить матрицу в режиме force для этих Fgrp?")
+                print(f"   Это перезапишет CatID для Fgrp: {mismatched_fgrps[:10]}{'...' if len(mismatched_fgrps) > 10 else ''}")
+                force_confirm = input("   Применить force для несоответствий? (y/n, по умолчанию y): ").strip().lower()
+                
+                if force_confirm != 'n':
+                    try:
+                        ensure_catid_by_fgrp(mode="fill", changed_fgrps=mismatched_fgrps)
+                        print(f"✅ Матрица применена в режиме force для {len(mismatched_fgrps)} Fgrp с несоответствиями")
+                    except Exception as e:
+                        print(f"❌ Ошибка при применении матрицы: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print("ℹ️ Пропущено применение force для несоответствий.")
+            else:
+                print("⚠️ Не удалось определить список Fgrp для применения force.")
+        except Exception as e:
+            print(f"❌ Ошибка при обработке несоответствий: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("✅ Несоответствий не обнаружено - все CatID соответствуют матрице.")
+    
+    print_catid_statistics("После шага 6 (Fgrp matrix)")
 
     # Стоимость дилера
     compute_dealer_stock_price()
@@ -1763,6 +1928,36 @@ def postprocess_prices():
     # Описания: >>>(...) и !!! NOT STORED ANYMORE !!!
     enrich_descriptions_from_replacements()
 
+    # 7) Анализ распределения CatID по FunctionGroup
+    #    Показывает причины различий CatID внутри одной Fgrp
+    print("\n" + "="*70)
+    print("ШАГ 7: Анализ распределения CatID по FunctionGroup")
+    print("="*70)
+    print("\n❓ Проанализировать распределение CatID по FunctionGroup?")
+    print("   Это поможет понять, почему в одной Fgrp есть разные CatID")
+    print("   и по каким правилам они были заполнены.")
+    print("\n   Варианты:")
+    print("   - 'y' или Enter: запустить анализ (создаст Excel отчёт)")
+    print("   - 'f N': проанализировать конкретную Fgrp (например, 'f 123')")
+    print("   - 'n': пропустить анализ")
+    
+    response = input("   Ваш выбор (y/f N/n, по умолчанию y): ").strip().lower()
+    
+    if response.startswith('f '):
+        # Анализ конкретной Fgrp
+        try:
+            fgrp_num = int(response.split()[1])
+            print(f"\n📊 Анализируем Fgrp={fgrp_num}...")
+            analyze_fgrp_catid_distribution(fgrp=fgrp_num, export_to_excel=True)
+        except (ValueError, IndexError):
+            print("⚠️ Неверный формат. Используйте 'f 123' для анализа Fgrp=123")
+    elif response != 'n':
+        # Анализ всех Fgrp
+        print("\n📊 Анализируем все FunctionGroup с разными CatID...")
+        analyze_fgrp_catid_distribution(export_to_excel=True)
+    else:
+        print("   Пропускаем анализ распределения CatID.")
+    
     # Отчёт по качеству CatID
     export_catid_quality_report()
 
@@ -1782,46 +1977,4 @@ def run_pipeline():
 
 if __name__ == "__main__":
     run_pipeline()
-
-
-
-def ensure_catid_accessories():
-    """Назначает CatID для аксессуаров по ProductGroup:
-    - PG=15 → CatID='20'
-    - PG=25 → CatID='80'
-    Обновляет только пустые CatID, не перезаписывает существующие.
-    
-    ПРИМЕЧАНИЕ: Эта функция дублирует функциональность ensure_catid_by_pg().
-    Рекомендуется использовать ensure_catid_by_pg({15: '20', 25: '80'}) вместо этой функции.
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cur = conn.cursor()
-    empty_condition = get_empty_catid_condition()
-
-    cur.execute(f"""
-        UPDATE {PRICELIST_TABLE_NAME}
-        SET CatID = '20'
-        WHERE ProductGroup = 15 AND {empty_condition}
-    """)
-    count20 = cur.rowcount
-
-    cur.execute(f"""
-        UPDATE {PRICELIST_TABLE_NAME}
-        SET CatID = '80'
-        WHERE ProductGroup = 25 AND {empty_condition}
-    """)
-    count80 = cur.rowcount
-
-    conn.commit()
-    conn.close()
-    print(f"🏷️ Accessories назначены: PG=15 → CatID='20' ({count20}), PG=25 → CatID='80' ({count80}). (только пустые)")
-
-
-
-
-
-
-
-
-
 
